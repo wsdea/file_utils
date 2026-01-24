@@ -33,3 +33,17 @@ To scan and remove duplicates:
 
 ### Notes
 - **Caution**: Ensure you review the output before using the `--go` flag, as it will permanently delete files.
+
+### Testing
+
+To run the tests for `remove_duplicates`, ensure you have pytest installed:
+
+```bash
+pip install pytest
+```
+
+Run the tests with:
+
+```bash
+pytest tests
+```
