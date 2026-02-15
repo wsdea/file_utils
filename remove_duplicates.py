@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 
 """
-Script for removing duplicate files based on partial SHA-256 hashes.
-Keeping the file with the shortest basename when duplicates are found.
-Showing which files would be removed by default.
-Using --go flag for actually removing the files.
-Caching hashes in a JSON file for memoizing previous computations.
-Computing hash using only the first 1 MB of each file.
+Script for removing duplicate files using staged hashing.
+
+Process:
+1. Computing SHA-256 of first 1 MB.
+2. If matching, verifying file size equality.
+3. If sizes matching, computing SHA-256 of last 10 MB.
+4. Removing only if all checks matching.
+
+Keeping the file with the shortest basename.
+Caching first and last hashes in a JSON file.
 Using tqdm for showing progress.
 
 Usage: remove_duplicates.py <directory> [--go]
-  <directory> : The directory for scanning duplicates.
-  --go        : Actually removing the duplicate files.
 """
 
 import argparse
@@ -23,7 +25,8 @@ import os
 from tqdm import tqdm
 
 CACHE_FILENAME = ".remove_duplicates_cache.json"
-HASH_READ_SIZE = 1024 * 1024  # 1 MB
+FIRST_CHUNK_SIZE = 1024 * 1024  # 1 MB
+LAST_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
 def load_cache(cache_path):
@@ -46,11 +49,22 @@ def save_cache(cache_path, cache_data):
         print(f"Warning: Cannot save cache: {e}")
 
 
-def compute_sha256_partial(file_path):
-    """Computing SHA-256 hash using only first 1 MB of file."""
+def compute_first_hash(file_path):
+    """Computing SHA-256 using first 1 MB of file."""
     hash_func = hashlib.sha256()
     with open(file_path, "rb") as f:
-        data = f.read(HASH_READ_SIZE)
+        data = f.read(FIRST_CHUNK_SIZE)
+        hash_func.update(data)
+    return hash_func.hexdigest()
+
+
+def compute_last_hash(file_path, size):
+    """Computing SHA-256 using last 10 MB of file."""
+    hash_func = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        if size > LAST_CHUNK_SIZE:
+            f.seek(size - LAST_CHUNK_SIZE)
+        data = f.read(LAST_CHUNK_SIZE)
         hash_func.update(data)
     return hash_func.hexdigest()
 
@@ -69,12 +83,10 @@ def should_replace(existing_path, candidate_path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Script for removing duplicate files using cached partial SHA-256 hashes."
+        description="Script for removing duplicate files using staged hashing."
     )
-    parser.add_argument("directory", help="The directory for scanning duplicates.")
-    parser.add_argument(
-        "--go", action="store_true", help="Actually removing the duplicate files."
-    )
+    parser.add_argument("directory", help="Directory for scanning duplicates.")
+    parser.add_argument("--go", action="store_true", help="Actually removing files.")
     args = parser.parse_args()
 
     base_dir = args.directory
@@ -85,7 +97,8 @@ def main():
     cache_path = os.path.join(base_dir, CACHE_FILENAME)
     cache = load_cache(cache_path)
 
-    global_hashes = {}
+    # Mapping: (size, first_hash) -> list of file paths
+    candidates = {}
 
     files = [
         p
@@ -96,8 +109,8 @@ def main():
     for file_path in tqdm(files, desc="Scanning files"):
         try:
             stat = os.stat(file_path)
-            mtime = stat.st_mtime
             size = stat.st_size
+            mtime = stat.st_mtime
 
             cache_entry = cache.get(file_path)
 
@@ -106,38 +119,61 @@ def main():
                 and cache_entry.get("mtime") == mtime
                 and cache_entry.get("size") == size
             ):
-                file_hash = cache_entry["hash"]
+                first_hash = cache_entry["first_hash"]
             else:
-                file_hash = compute_sha256_partial(file_path)
+                first_hash = compute_first_hash(file_path)
                 cache[file_path] = {
                     "mtime": mtime,
                     "size": size,
-                    "hash": file_hash,
+                    "first_hash": first_hash,
+                    "last_hash": None,
                 }
 
         except Exception as e:
-            print(f"Warning: Cannot hash file {file_path}: {e}")
+            print(f"Warning: Cannot process file {file_path}: {e}")
             continue
 
-        if file_hash in global_hashes:
-            existing = global_hashes[file_hash]
+        key = (size, first_hash)
+        candidates.setdefault(key, []).append(file_path)
 
-            if should_replace(existing, file_path):
-                remove_path = existing
-                global_hashes[file_hash] = file_path
+    # Processing potential duplicates
+    for (size, first_hash), paths in candidates.items():
+        if len(paths) < 2:
+            continue
+
+        last_hash_map = {}
+
+        for file_path in paths:
+            cache_entry = cache[file_path]
+
+            if cache_entry.get("last_hash"):
+                last_hash = cache_entry["last_hash"]
             else:
-                remove_path = file_path
+                last_hash = compute_last_hash(file_path, size)
+                cache_entry["last_hash"] = last_hash
 
-            print(f"Would remove: {remove_path}")
+            last_hash_map.setdefault(last_hash, []).append(file_path)
 
-            if go_flag:
-                try:
-                    os.remove(remove_path)
-                    print(f"removed '{remove_path}'")
-                except OSError as e:
-                    print(f"Error: Cannot remove file {remove_path}: {e}")
-        else:
-            global_hashes[file_hash] = file_path
+        for last_hash, dup_paths in last_hash_map.items():
+            if len(dup_paths) < 2:
+                continue
+
+            # Sorting to keep shortest basename
+            dup_paths_sorted = sorted(
+                dup_paths, key=lambda p: (len(os.path.basename(p)), os.path.basename(p))
+            )
+
+            keep = dup_paths_sorted[0]
+            to_remove = dup_paths_sorted[1:]
+
+            for remove_path in to_remove:
+                print(f"Would remove: {remove_path}")
+                if go_flag:
+                    try:
+                        os.remove(remove_path)
+                        print(f"removed '{remove_path}'")
+                    except OSError as e:
+                        print(f"Error: Cannot remove file {remove_path}: {e}")
 
     save_cache(cache_path, cache)
 
